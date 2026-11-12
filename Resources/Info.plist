@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>io.github.zhigang1992.AudioRelayBridge</string>
+    <key>CFBundleName</key><string>AudioRelay Bridge</string>
+    <key>CFBundleDisplayName</key><string>AudioRelay Bridge</string>
+    <key>CFBundleExecutable</key><string>AudioRelayBridge</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSMicrophoneUsageDescription</key><string>AudioRelay Bridge reads audio from BlackHole’s virtual input and plays it through your selected speakers or headphones. It does not record your microphone.</string>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+</dict></plist>

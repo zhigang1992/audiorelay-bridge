@@ -1,0 +1,22 @@
+name: Build and test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test audio routing and lifecycle
+        run: swift test
+      - name: Build universal app (ad-hoc signed)
+        run: UNIVERSAL=1 ./scripts/build.sh
+      - name: Archive app
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/AudioRelay Bridge.app" dist/AudioRelay-Bridge.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioRelay-Bridge-development
+          path: dist/AudioRelay-Bridge.zip
