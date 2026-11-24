@@ -10,6 +10,7 @@ AudioRelay Bridge is an independent community project, not affiliated with Audio
 - Converts sample rates without asking your headphones to change their hardware rate.
 - Reconnects when devices change and waits when a headset is using its call connection.
 - Shows connection status in a native menu-bar app and setup window.
+- Opens BlackHole only while an app is playing into it, so macOS’s orange microphone indicator stays off when nothing is relayed (macOS 14+).
 - Offers **Pause / Resume**, **Quit**, and optional **Launch at Login**.
 - Runs locally, with no accounts, analytics, recording, or network audio transmission.
 
@@ -72,6 +73,8 @@ The bridge adds roughly 200 ms of initial buffering at common sample rates (less
 **Waiting for BlackHole 2ch:** Install the 2-channel version. The app deliberately does not fall back to a physical microphone.
 
 **Microphone access is off:** Enable AudioRelay Bridge in System Settings → Privacy & Security → Microphone, then reopen the app if requested.
+
+**Waiting for audio / Idle:** Nothing is playing into BlackHole 2ch, so the bridge has closed its input and the microphone indicator is off. It starts within about a second when AudioRelay plays into BlackHole, and closes again about five seconds after playback stops. On macOS 13, which cannot tell which app is using BlackHole, the input stays open after the first playback, as in earlier versions.
 
 **Bridge active but silent:** “Active” means the audio devices are open, not that AudioRelay is sending non-silent samples. Check that AudioRelay is connected, playing, and targeting BlackHole 2ch. Also check volume on the source and Mac.
 
