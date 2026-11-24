@@ -598,6 +598,68 @@ func microphoneMessage() -> String {
     return "BlackHole opened with no audio format (microphone permission: \(status)). macOS treats reading BlackHole as microphone access. Allow AudioRelay Bridge in System Settings → Privacy & Security → Microphone."
 }
 
+// Opening BlackHole for input turns on macOS’s microphone indicator, so capture
+// runs only while another process is playing into BlackHole.
+
+struct ProcessIO: Equatable {
+    let pid: pid_t
+    let isRunningOutput: Bool
+    let devices: [AudioDeviceID]
+}
+
+func hasPlayer(into device: AudioDeviceID, among processes: [ProcessIO], excluding ownPID: pid_t) -> Bool {
+    processes.contains { $0.pid != ownPID && $0.isRunningOutput && $0.devices.contains(device) }
+}
+
+func objectList(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
+    var address = propertyAddress(selector, scope: scope)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(object, &address, 0, nil, &size) == noErr, size > 0 else { return [] }
+    var ids = Array(repeating: AudioObjectID(0), count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids
+}
+
+func uint32Property(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
+    var address = propertyAddress(selector)
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr else { return nil }
+    return value
+}
+
+@available(macOS 14.0, *)
+func audioProcessObjects() -> [AudioObjectID] {
+    objectList(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)
+}
+
+@available(macOS 14.0, *)
+func audioProcesses() -> [ProcessIO] {
+    audioProcessObjects().map { process in
+        ProcessIO(pid: pid_t(bitPattern: uint32Property(process, kAudioProcessPropertyPID) ?? 0),
+                  isRunningOutput: (uint32Property(process, kAudioProcessPropertyIsRunningOutput) ?? 0) != 0,
+                  devices: withSubDevices(objectList(process, kAudioProcessPropertyDevices,
+                                                     scope: kAudioObjectPropertyScopeOutput)))
+    }
+}
+
+/// Adds the members of aggregate devices, so a Multi-Output Device that includes BlackHole counts as BlackHole.
+func withSubDevices(_ devices: [AudioDeviceID]) -> [AudioDeviceID] {
+    var result: [AudioDeviceID] = []
+    var pending = devices
+    while let device = pending.popLast() {
+        guard !result.contains(device) else { continue }
+        result.append(device)
+        pending += objectList(device, kAudioAggregateDevicePropertyActiveSubDeviceList)
+    }
+    return result
+}
+
+func isRunningSomewhere(_ device: AudioDeviceID) -> Bool {
+    (uint32Property(device, kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 0) != 0
+}
+
 // Lifecycle and device listeners are confined to the main queue.
 final class Supervisor {
     var onStatus: ((String, Bool) -> Void)?
@@ -615,10 +677,19 @@ final class Supervisor {
     private var retryItem: DispatchWorkItem?
     private var deviceBlock: AudioObjectPropertyListenerBlock?
     private var watches: [(AudioDeviceID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+    // Listeners that detect players on BlackHole. They live while watching, not only while the engine runs.
+    private var sourceWatches: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+    private var watchedSource: AudioDeviceID?
+    private var watchedProcesses: [AudioObjectID] = []
+    private var idleItem: DispatchWorkItem?
+    /// How long capture keeps running after the last player stops, so gaps between tracks don’t flap.
+    let idleGrace: TimeInterval
+    static let idleMessage = "Idle. The bridge starts listening when audio plays into BlackHole 2ch."
 
-    init(wantedInput: String?, wantedOutput: String?) {
+    init(wantedInput: String?, wantedOutput: String?, idleGrace: TimeInterval = 5) {
         self.wantedInput = wantedInput
         self.wantedOutput = wantedOutput
+        self.idleGrace = idleGrace
     }
 
     func startWatching() {
@@ -634,12 +705,21 @@ final class Supervisor {
         var defaultAddress = propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
         AudioObjectAddPropertyListenerBlock(system, &devicesAddress, .main, block)
         AudioObjectAddPropertyListenerBlock(system, &defaultAddress, .main, block)
+        if #available(macOS 14.0, *) {
+            addSourceWatch(system, kAudioHardwarePropertyProcessObjectList) { [weak self] in
+                self?.refreshProcessWatches()
+                self?.evaluate()
+            }
+            refreshProcessWatches()
+        }
         evaluate()
     }
 
     func stopWatching() {
         isWatching = false
         cancelRetry()
+        cancelIdleStop()
+        clearSourceWatches()
         if let block = deviceBlock {
             let system = AudioObjectID(kAudioObjectSystemObject)
             var devicesAddress = propertyAddress(kAudioHardwarePropertyDevices)
@@ -670,17 +750,31 @@ final class Supervisor {
         let devices = allDevices()
         let input = try? chooseInput(devices, wanted: wantedInput)
         let output = try? chooseOutput(devices, wanted: wantedOutput)
+        watchSource(input?.id)
         guard let input, let output else {
+            cancelIdleStop()
             stopEngine()
             report(waitingMessage(devices))
             scheduleRetry()
             return
         }
-        if engine != nil,
-           runningInput == input.id, runningOutput == output.id,
-           runningInputRate == input.nominalRate, runningOutputRate == output.nominalRate {
+        let unchanged = engine != nil
+            && runningInput == input.id && runningOutput == output.id
+            && runningInputRate == input.nominalRate && runningOutputRate == output.nominalRate
+        guard sourceIsPlaying(input.id) else {
+            cancelRetry()
+            if unchanged {
+                // Keep relaying through short gaps; stop once the grace period passes.
+                scheduleIdleStop(source: input.id)
+            } else {
+                cancelIdleStop()
+                stopEngine()
+                report(Self.idleMessage)
+            }
             return
         }
+        cancelIdleStop()
+        if unchanged { return }
 
         stopEngine()
         let started = Engine(input: input, output: output)
@@ -763,6 +857,88 @@ final class Supervisor {
     func cancelRetry() {
         retryItem?.cancel()
         retryItem = nil
+    }
+
+    /// True when another process is playing into `source`.
+    func sourceIsPlaying(_ source: AudioDeviceID) -> Bool {
+        if #available(macOS 14.0, *) {
+            return hasPlayer(into: source, among: audioProcesses(), excluding: getpid())
+        }
+        // macOS 13 has no per-process view, and our own capture keeps BlackHole running,
+        // so once capture starts it stays on (the behaviour before lazy capture).
+        if engine != nil, runningInput == source { return true }
+        return isRunningSomewhere(source)
+    }
+
+    func scheduleIdleStop(source: AudioDeviceID) {
+        guard idleItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.idleItem = nil
+            guard self.isWatching else { return }
+            if self.sourceIsPlaying(source) {
+                self.evaluate()
+                return
+            }
+            self.stopEngine()
+            self.report(Self.idleMessage)
+        }
+        idleItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + idleGrace, execute: item)
+    }
+
+    func cancelIdleStop() {
+        idleItem?.cancel()
+        idleItem = nil
+    }
+
+    func addSourceWatch(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ action: @escaping () -> Void) {
+        var address = propertyAddress(selector)
+        let block: AudioObjectPropertyListenerBlock = { _, _ in action() }
+        guard AudioObjectAddPropertyListenerBlock(object, &address, .main, block) == noErr else { return }
+        sourceWatches.append((object, address, block))
+    }
+
+    func removeSourceWatches(of objects: Set<AudioObjectID>) {
+        sourceWatches.removeAll { object, address, block in
+            guard objects.contains(object) else { return false }
+            var address = address
+            AudioObjectRemovePropertyListenerBlock(object, &address, .main, block)
+            return true
+        }
+    }
+
+    func clearSourceWatches() {
+        removeSourceWatches(of: Set(sourceWatches.map { $0.0 }))
+        watchedSource = nil
+        watchedProcesses = []
+    }
+
+    /// Wakes evaluation when BlackHole starts or stops running (the only signal on macOS 13).
+    func watchSource(_ source: AudioDeviceID?) {
+        guard source != watchedSource else { return }
+        if let watchedSource { removeSourceWatches(of: [watchedSource]) }
+        watchedSource = source
+        if let source {
+            addSourceWatch(source, kAudioDevicePropertyDeviceIsRunningSomewhere) { [weak self] in self?.evaluate() }
+        }
+    }
+
+    /// Wakes evaluation when any other process starts or stops output, or changes its devices.
+    @available(macOS 14.0, *)
+    func refreshProcessWatches() {
+        guard isWatching else { return }
+        let ownPID = getpid()
+        let current = audioProcessObjects().filter {
+            pid_t(bitPattern: uint32Property($0, kAudioProcessPropertyPID) ?? 0) != ownPID
+        }
+        removeSourceWatches(of: Set(watchedProcesses).subtracting(current))
+        for process in current where !watchedProcesses.contains(process) {
+            for selector in [kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyDevices] {
+                addSourceWatch(process, selector) { [weak self] in self?.evaluate() }
+            }
+        }
+        watchedProcesses = current
     }
 
     func watch(_ id: AudioDeviceID) {

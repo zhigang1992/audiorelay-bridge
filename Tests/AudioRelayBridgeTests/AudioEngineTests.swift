@@ -107,4 +107,16 @@ final class AudioEngineTests: XCTestCase {
         }
         wait(for: [fault], timeout: 1)
     }
+
+    func testCaptureNeedsAnotherProcessPlayingIntoBlackHole() {
+        let blackHole: AudioDeviceID = 103, speakers: AudioDeviceID = 131, me: pid_t = 10
+        let ownCapture = ProcessIO(pid: me, isRunningOutput: true, devices: [blackHole, speakers])
+        let music = ProcessIO(pid: 20, isRunningOutput: true, devices: [speakers])
+        let relayIdle = ProcessIO(pid: 30, isRunningOutput: false, devices: [blackHole])
+        let relayPlaying = ProcessIO(pid: 30, isRunningOutput: true, devices: [blackHole])
+        XCTAssertFalse(hasPlayer(into: blackHole, among: [], excluding: me))
+        XCTAssertFalse(hasPlayer(into: blackHole, among: [ownCapture, music], excluding: me))
+        XCTAssertFalse(hasPlayer(into: blackHole, among: [ownCapture, relayIdle], excluding: me))
+        XCTAssertTrue(hasPlayer(into: blackHole, among: [ownCapture, music, relayPlaying], excluding: me))
+    }
 }
